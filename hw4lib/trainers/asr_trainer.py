@@ -103,7 +103,11 @@ class ASRTrainer(BaseTrainer):
             feat_lengths = feat_lengths.to(self.device)
             transcript_lengths = transcript_lengths.to(self.device)
 
-            with torch.autocast(device_type=self.device, dtype=torch.float16):
+            # Determine device type and appropriate dtype for mixed precision
+            device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
+            dtype = torch.float16 if device_type == 'cuda' else torch.bfloat16
+            
+            with torch.autocast(device_type=device_type, dtype=dtype):
                 # get raw predictions and attention weights and ctc inputs from model
                 seq_out, curr_att, ctc_inputs = self.model(feats, targets_shifted, feat_lengths, transcript_lengths)
                 
