@@ -224,11 +224,19 @@ class ASRDataset(Dataset):
                     
                 transcript = str(transcript) # Ensure native str
 
+
                 # Track character count (before tokenization)
                 self.total_chars += len(transcript)
 
                 # Use tokenizer to encode the transcript
                 tokenized = tokenizer.encode(transcript)
+
+                # Skip samples with empty features or transcripts to avoid NaN losses
+                if len(tokenized) == 0 or feat.shape[1] == 0:
+                    # Remove the last feature if it was added
+                    if self.isTrainPartition:
+                        self.feats.pop()
+                    continue
 
                 # Track token count (excluding special tokens)
                 self.total_tokens += len(tokenized)

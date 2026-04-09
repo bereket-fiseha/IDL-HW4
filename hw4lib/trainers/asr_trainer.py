@@ -141,6 +141,12 @@ class ASRTrainer(BaseTrainer):
 
             # Only update weights after accumulating enough gradients
             if (i + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
+                # Unscale gradients before clipping
+                self.scaler.unscale_(self.optimizer)
+                
+                # Clip gradients to prevent exploding gradients (NaNs)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                
                 self.scaler.step(self.optimizer)
                 if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step()
