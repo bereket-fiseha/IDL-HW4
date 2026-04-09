@@ -104,8 +104,9 @@ class ASRTrainer(BaseTrainer):
             transcript_lengths = transcript_lengths.to(self.device)
 
             # Determine device type and appropriate dtype for mixed precision
+            # NOTE: bfloat16 is preferred over float16 for stability with softmax/logsoftmax operations
             device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
-            dtype = torch.float16 if device_type == 'cuda' else torch.bfloat16
+            dtype = torch.bfloat16  # More stable than float16 for deep learning
             
             with torch.autocast(device_type=device_type, dtype=dtype):
                 # get raw predictions and attention weights and ctc inputs from model
@@ -119,7 +120,29 @@ class ASRTrainer(BaseTrainer):
                 
                 # Calculate CTC loss if needed
                 if self.ctc_weight > 0:
-                    ctc_loss = self.ctc_criterion(ctc_inputs['log_probs'], targets_golden, ctc_inputs['lengths'], transcript_lengths)
+                    # Validate CTC inputs before computing loss
+                    log_probs = ctc_inputs['log_probs']
+                    
+                    # Ensure valid shapes and values
+                    if torch.isnan(log_probs).any():
+                        print(f"⚠️  WARNING: CTC log_probs contains NaN at batch {i}")
+                        ctc_loss = torch.tensor(0.0, device=self.device)
+                    elif torch.isinf(log_probs).any():
+                        print(f"⚠️  WARNING: CTC log_probs contains Inf at batch {i}")
+                        ctc_loss = torch.tensor(0.0, device=self.device)
+                    else:
+                        try:
+                            ctc_loss = self.ctc_criterion(log_probs, targets_golden, ctc_inputs['lengths'], transcript_lengths)
+                            if torch.isnan(ctc_loss):
+                                print(f"⚠️  WARNING: CTC loss computed to NaN at batch {i}")
+                                print(f"   Log probs shape: {log_probs.shape}")
+                                print(f"   Targets shape: {targets_golden.shape}")
+                                print(f"   Input lengths: {ctc_inputs['lengths']}")
+                                print(f"   Target lengths: {transcript_lengths}")
+                                ctc_loss = torch.tensor(0.0, device=self.device)
+                        except Exception as e:
+                            print(f"⚠️  ERROR computing CTC loss: {e}")
+                            ctc_loss = torch.tensor(0.0, device=self.device)
                     loss = ce_loss + self.ctc_weight * ctc_loss
                 else:
                     ctc_loss = torch.tensor(0.0)
@@ -128,6 +151,23 @@ class ASRTrainer(BaseTrainer):
             # Calculate metrics
             batch_tokens = transcript_lengths.sum().item()
             total_tokens += batch_tokens
+            
+            # Check for NaN in loss values - CRITICAL for debugging
+            if torch.isnan(ce_loss):
+                print(f"⚠️  WARNING: CE Loss is NaN at batch {i}")
+                print(f"   seq_out stats: min={seq_out.min():.4f}, max={seq_out.max():.4f}, has_nan={torch.isnan(seq_out).any()}")
+                print(f"   targets_golden stats: shape={targets_golden.shape}, min={targets_golden.min()}, max={targets_golden.max()}")
+                # Skip this batch to prevent accumulating NaN
+                self.optimizer.zero_grad()
+                continue
+            
+            if self.ctc_weight > 0 and torch.isnan(ctc_loss):
+                print(f"⚠️  WARNING: CTC Loss is NaN at batch {i}")
+                print(f"   ctc_log_probs stats: shape={ctc_inputs['log_probs'].shape}, has_nan={torch.isnan(ctc_inputs['log_probs']).any()}")
+                # Skip this batch to prevent accumulating NaN
+                self.optimizer.zero_grad()
+                continue
+            
             running_ce_loss += ce_loss.item() * batch_tokens
             if self.ctc_weight > 0:
                 running_ctc_loss += ctc_loss.item() * batch_tokens
@@ -154,10 +194,15 @@ class ASRTrainer(BaseTrainer):
                 self.optimizer.zero_grad()
 
             # Update progress bar
-            avg_ce_loss = running_ce_loss / total_tokens
-            avg_ctc_loss = running_ctc_loss / total_tokens
-            avg_joint_loss = running_joint_loss / total_tokens
-            perplexity = torch.exp(torch.tensor(avg_ce_loss))
+            avg_ce_loss = running_ce_loss / total_tokens if total_tokens > 0 else 0.0
+            avg_ctc_loss = running_ctc_loss / total_tokens if total_tokens > 0 else 0.0
+            avg_joint_loss = running_joint_loss / total_tokens if total_tokens > 0 else 0.0
+            
+            # Safe perplexity calculation - handle edge cases
+            if avg_ce_loss > 0:
+                perplexity = torch.exp(torch.tensor(avg_ce_loss))
+            else:
+                perplexity = torch.tensor(0.0)
             
             batch_bar.set_postfix(
                 ce_loss=f"{avg_ce_loss:.4f}",
@@ -182,11 +227,14 @@ class ASRTrainer(BaseTrainer):
             self.optimizer.zero_grad()
 
         # Compute final metrics
-        avg_ce_loss = running_ce_loss / total_tokens
-        avg_ctc_loss = running_ctc_loss / total_tokens
-        avg_joint_loss = running_joint_loss / total_tokens
-        avg_perplexity_token = torch.exp(torch.tensor(avg_ce_loss))
-        avg_perplexity_char = torch.exp(torch.tensor(avg_ce_loss / dataloader.dataset.get_avg_chars_per_token()))
+        avg_ce_loss = running_ce_loss / total_tokens if total_tokens > 0 else float('nan')
+        avg_ctc_loss = running_ctc_loss / total_tokens if total_tokens > 0 else float('nan')
+        avg_joint_loss = running_joint_loss / total_tokens if total_tokens > 0 else float('nan')
+        
+        # Be careful with log of negative numbers - add small epsilon
+        avg_ce_loss_clamped = max(avg_ce_loss, 1e-10) if not (isinstance(avg_ce_loss, float) and (avg_ce_loss != avg_ce_loss or avg_ce_loss == float('inf'))) else 0.0
+        avg_perplexity_token = torch.exp(torch.tensor(avg_ce_loss_clamped, device=self.device))
+        avg_perplexity_char = torch.exp(torch.tensor(avg_ce_loss_clamped / dataloader.dataset.get_avg_chars_per_token(), device=self.device))
         batch_bar.close()
 
         return {
