@@ -120,53 +120,15 @@ class ASRTrainer(BaseTrainer):
                 
                 # Calculate CTC loss if needed
                 if self.ctc_weight > 0:
-                    # Validate CTC inputs before computing loss
-                    log_probs = ctc_inputs['log_probs']
-                    
-                    # Ensure valid shapes and values
-                    if torch.isnan(log_probs).any():
-                        print(f"⚠️  WARNING: CTC log_probs contains NaN at batch {i}")
-                        ctc_loss = torch.tensor(0.0, device=self.device)
-                    elif torch.isinf(log_probs).any():
-                        print(f"⚠️  WARNING: CTC log_probs contains Inf at batch {i}")
-                        ctc_loss = torch.tensor(0.0, device=self.device)
-                    else:
-                        try:
-                            ctc_loss = self.ctc_criterion(log_probs, targets_golden, ctc_inputs['lengths'], transcript_lengths)
-                            if torch.isnan(ctc_loss):
-                                print(f"⚠️  WARNING: CTC loss computed to NaN at batch {i}")
-                                print(f"   Log probs shape: {log_probs.shape}")
-                                print(f"   Targets shape: {targets_golden.shape}")
-                                print(f"   Input lengths: {ctc_inputs['lengths']}")
-                                print(f"   Target lengths: {transcript_lengths}")
-                                ctc_loss = torch.tensor(0.0, device=self.device)
-                        except Exception as e:
-                            print(f"⚠️  ERROR computing CTC loss: {e}")
-                            ctc_loss = torch.tensor(0.0, device=self.device)
+                    ctc_loss = self.ctc_criterion(ctc_inputs['log_probs'], targets_golden, ctc_inputs['lengths'], transcript_lengths)
                     loss = ce_loss + self.ctc_weight * ctc_loss
                 else:
-                    ctc_loss = torch.tensor(0.0)
+                    ctc_loss = torch.tensor(0.0, device=self.device)
                     loss = ce_loss
 
             # Calculate metrics
             batch_tokens = transcript_lengths.sum().item()
             total_tokens += batch_tokens
-            
-            # Check for NaN in loss values - CRITICAL for debugging
-            if torch.isnan(ce_loss):
-                print(f"⚠️  WARNING: CE Loss is NaN at batch {i}")
-                print(f"   seq_out stats: min={seq_out.min():.4f}, max={seq_out.max():.4f}, has_nan={torch.isnan(seq_out).any()}")
-                print(f"   targets_golden stats: shape={targets_golden.shape}, min={targets_golden.min()}, max={targets_golden.max()}")
-                # Skip this batch to prevent accumulating NaN
-                self.optimizer.zero_grad()
-                continue
-            
-            if self.ctc_weight > 0 and torch.isnan(ctc_loss):
-                print(f"⚠️  WARNING: CTC Loss is NaN at batch {i}")
-                print(f"   ctc_log_probs stats: shape={ctc_inputs['log_probs'].shape}, has_nan={torch.isnan(ctc_inputs['log_probs']).any()}")
-                # Skip this batch to prevent accumulating NaN
-                self.optimizer.zero_grad()
-                continue
             
             running_ce_loss += ce_loss.item() * batch_tokens
             if self.ctc_weight > 0:
