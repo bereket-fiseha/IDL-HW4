@@ -175,10 +175,9 @@ class ASRTrainer(BaseTrainer):
             )
             batch_bar.update()
 
-            # Clean up
+            # Clean up - REMOVED torch.cuda.empty_cache() as it causes GPU-CPU sync overhead
             del feats, targets_shifted, targets_golden, feat_lengths, transcript_lengths
             del seq_out, curr_att, ctc_inputs, loss
-            torch.cuda.empty_cache()
 
         # Handle remaining gradients
         if (len(dataloader) % self.config['training']['gradient_accumulation_steps']) != 0:
@@ -445,8 +444,7 @@ class ASRTrainer(BaseTrainer):
 
                 # Clean up
                 del feats, feat_lengths, encoder_output, pad_mask_src, prompts
-                torch.cuda.empty_cache()
-
+                
                 # Post process sequences
                 post_processed_preds = generator.post_process_sequence(seqs, self.tokenizer)
                 
