@@ -151,8 +151,9 @@ class StackedBLSTMEmbedding(nn.Module):
         output = output.transpose(1, 2)  # (batch, seq_len, hidden_dim)
         x_len = self.calculate_pool_output_length(x_len, self.pool1_params)
         
-        # Second BLSTM
-        packed_input = pack_padded_sequence(output, x_len.cpu(), batch_first=True, enforce_sorted=False)
+        # Second BLSTM — cache .cpu() to avoid a second GPU→CPU sync
+        x_len_cpu = x_len.cpu()
+        packed_input = pack_padded_sequence(output, x_len_cpu, batch_first=True, enforce_sorted=False)
         packed_output, _ = self.blstm2(packed_input)
         output, _ = pad_packed_sequence(packed_output, batch_first=True, total_length=output.size(1))
         
@@ -219,7 +220,7 @@ class Conv2DSubsampling(torch.nn.Module):
         # x = self.freq_pool(x)  # (batch, channels, time, 1)
         # x = x.squeeze(-1).transpose(1, 2)  # (batch, time, channels)
         
-        x = x.transpose(1, 2).contiguous().view(x.size(0), x.size(2), -1) # (batch, time, channels)
+        x = x.transpose(1, 2).reshape(x.size(0), x.size(2), -1) # (batch, time, channels)
         x = self.linear_out(x) # (batch, time, channels)
         x = self.dropout(x)
         

@@ -140,7 +140,13 @@ class DecoderOnlyTransformer(nn.Module):
         if target_lengths is not None:
             pad_mask_dec = PadMask(target_lengths, padded_targets.size(1)).to(padded_targets.device)
         
-        causal_mask = CausalMask(padded_targets.size(1)).to(padded_targets.device)
+        # Cache causal mask by length — avoids reallocating the same tensor every forward pass
+        tgt_len = padded_targets.size(1)
+        if not hasattr(self, '_causal_mask_cache'):
+            self._causal_mask_cache = {}
+        if tgt_len not in self._causal_mask_cache:
+            self._causal_mask_cache[tgt_len] = CausalMask(tgt_len).to(padded_targets.device)
+        causal_mask = self._causal_mask_cache[tgt_len]
 
         x = self.target_embedding(padded_targets)
         x = self.positional_encoding(x)
@@ -153,7 +159,7 @@ class DecoderOnlyTransformer(nn.Module):
                 continue
             
             x, attention = self.dec_layers[i](x, pad_mask_dec, causal_mask)
-            runnint_att['layer{}_dec_self'.format(i + 1)] = attention
+            runnint_att['layer{}_dec_self'.format(i + 1)] = attention.detach()
 
         x = self.norm(x)
         seq_out = self.final_linear(x)
@@ -285,7 +291,7 @@ class EncoderDecoderTransformer(nn.Module):
                 continue
  
             x_enc, attention = self.enc_layers[i](x_enc, pad_mask_src)
-            running_att[f'layer{i+1}_enc_self'] = attention
+            running_att[f'layer{i+1}_enc_self'] = attention.detach()
 
         x_enc = self.encoder_norm(x_enc)
         ctc_logits = self.ctc_head(x_enc)
@@ -318,7 +324,13 @@ class EncoderDecoderTransformer(nn.Module):
         if pad_mask_tgt is None and self.training:
             warnings.warn("pad_mask_tgt is None, unless you are using the decoder as a standalone model or doing inference, you should provide target_lengths")
 
-        causal_mask = CausalMask(padded_targets.size(1)).to(padded_targets.device)
+        # Cache causal mask by length — avoids reallocating the same tensor every forward pass
+        tgt_len = padded_targets.size(1)
+        if not hasattr(self, '_causal_mask_cache'):
+            self._causal_mask_cache = {}
+        if tgt_len not in self._causal_mask_cache:
+            self._causal_mask_cache[tgt_len] = CausalMask(tgt_len).to(padded_targets.device)
+        causal_mask = self._causal_mask_cache[tgt_len]
 
         x_dec = self.target_embedding(padded_targets)
         if not self.skip_decoder_pe:
@@ -331,8 +343,8 @@ class EncoderDecoderTransformer(nn.Module):
                 continue
  
             x_dec, self_attn, cross_attn = self.dec_layers[i](x_dec, encoder_output, pad_mask_tgt, pad_mask_src, causal_mask)
-            running_att[f'layer{i+1}_dec_self'] = self_attn
-            running_att[f'layer{i+1}_dec_cross'] = cross_attn
+            running_att[f'layer{i+1}_dec_self'] = self_attn.detach()
+            running_att[f'layer{i+1}_dec_cross'] = cross_attn.detach()
 
         x_dec = self.decoder_norm(x_dec)
         seq_out = self.final_linear(x_dec)

@@ -9,6 +9,7 @@ from ..utils import create_scheduler, create_optimizer
 from ..model import DecoderOnlyTransformer
 # import torchaudio.functional as aF # Move to where it's needed if it's ever used
 import json
+import math
 import torchmetrics.text as tmt
 from torch.utils.data import Subset
 import pandas as pd
@@ -72,6 +73,9 @@ class ASRTrainer(BaseTrainer):
                 zero_infinity=True
             )
 
+        # Cache device_type string — avoids recomputing 'cuda' in str(self.device) every batch
+        self._device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
+
 
     def _train_epoch(self, dataloader):
         """
@@ -91,6 +95,9 @@ class ASRTrainer(BaseTrainer):
         total_tokens = 0
         running_att = None  # Initialize running_att here
 
+        # Cache accumulation steps to avoid dict lookup every batch
+        accum_steps = self.config['training']['gradient_accumulation_steps']
+
         # Only zero gradients when starting a new accumulation cycle
         self.optimizer.zero_grad()
 
@@ -105,10 +112,9 @@ class ASRTrainer(BaseTrainer):
 
             # Determine device type and appropriate dtype for mixed precision
             # NOTE: bfloat16 is preferred over float16 for stability with softmax/logsoftmax operations
-            device_type = 'cuda' if 'cuda' in str(self.device) else 'cpu'
             dtype = torch.bfloat16  # More stable than float16 for deep learning
             
-            with torch.autocast(device_type=device_type, dtype=dtype):
+            with torch.autocast(device_type=self._device_type, dtype=dtype):
                 # get raw predictions and attention weights and ctc inputs from model
                 seq_out, curr_att, ctc_inputs = self.model(feats, targets_shifted, feat_lengths, transcript_lengths)
                 
@@ -136,13 +142,13 @@ class ASRTrainer(BaseTrainer):
             running_joint_loss += loss.item() * batch_tokens
             
             # Normalize loss by accumulation steps
-            loss = loss / self.config['training']['gradient_accumulation_steps']
+            loss = loss / accum_steps
 
             # Backpropagate the loss
             self.scaler.scale(loss).backward()
 
             # Only update weights after accumulating enough gradients
-            if (i + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
+            if (i + 1) % accum_steps == 0:
                 # Unscale gradients before clipping
                 self.scaler.unscale_(self.optimizer)
                 
@@ -160,18 +166,15 @@ class ASRTrainer(BaseTrainer):
             avg_ctc_loss = running_ctc_loss / total_tokens if total_tokens > 0 else 0.0
             avg_joint_loss = running_joint_loss / total_tokens if total_tokens > 0 else 0.0
             
-            # Safe perplexity calculation - handle edge cases
-            if avg_ce_loss > 0:
-                perplexity = torch.exp(torch.tensor(avg_ce_loss))
-            else:
-                perplexity = torch.tensor(0.0)
+            # Safe perplexity calculation using math.exp — avoids tensor allocation every batch
+            perplexity = math.exp(avg_ce_loss) if avg_ce_loss > 0 else 0.0
             
             batch_bar.set_postfix(
                 ce_loss=f"{avg_ce_loss:.4f}",
                 ctc_loss=f"{avg_ctc_loss:.4f}", 
                 joint_loss=f"{avg_joint_loss:.4f}",
                 perplexity=f"{perplexity:.4f}",
-                acc_step=f"{(i % self.config['training']['gradient_accumulation_steps']) + 1}/{self.config['training']['gradient_accumulation_steps']}"
+                acc_step=f"{(i % accum_steps) + 1}/{accum_steps}"
             )
             batch_bar.update()
 
@@ -180,7 +183,7 @@ class ASRTrainer(BaseTrainer):
             del seq_out, curr_att, ctc_inputs, loss
 
         # Handle remaining gradients
-        if (len(dataloader) % self.config['training']['gradient_accumulation_steps']) != 0:
+        if (len(dataloader) % accum_steps) != 0:
             self.scaler.step(self.optimizer)
             if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step()
@@ -396,6 +399,14 @@ class ASRTrainer(BaseTrainer):
         batch_bar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc=f"[Recognizing ASR] : {config_name}")
         results = []
 
+        # Cache recognition config values to avoid repeated dict lookups in the hot loop
+        beam_width = recognition_config['beam_width']
+        temperature = recognition_config['temperature']
+        repeat_penalty = recognition_config['repeat_penalty']
+        num_batches = recognition_config['num_batches']
+        lm_model = recognition_config.get('lm_model')
+        lm_weight = recognition_config.get('lm_weight', 0.0)
+
         # Run inference
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
@@ -410,9 +421,9 @@ class ASRTrainer(BaseTrainer):
                 # Define scoring function for this batch
                 def get_score(x):
                     asr_logits = self.model.score(x, encoder_output, pad_mask_src)
-                    if recognition_config.get('lm_model') is not None:
-                        lm_logits = recognition_config['lm_model'].score(x)
-                        return asr_logits + recognition_config['lm_weight'] * lm_logits
+                    if lm_model is not None:
+                        lm_logits = lm_model.score(x)
+                        return asr_logits + lm_weight * lm_logits
                     return asr_logits
                 
                 # Set score function of generator
@@ -423,13 +434,13 @@ class ASRTrainer(BaseTrainer):
                 prompts = torch.full((batch_size, 1), self.tokenizer.sos_id, dtype=torch.long, device=self.device)
 
                 # Generate sequences
-                if recognition_config['beam_width'] > 1:
+                if beam_width > 1:
                     # generate sequences using beam search
                     seqs, scores = generator.generate_beam(
                         prompts, 
-                        beam_width=recognition_config['beam_width'],
-                        temperature=recognition_config['temperature'],
-                        repeat_penalty=recognition_config['repeat_penalty']
+                        beam_width=beam_width,
+                        temperature=temperature,
+                        repeat_penalty=repeat_penalty
                     )
                     # Pick best beam
                     seqs = seqs[:, 0, :]
@@ -438,11 +449,11 @@ class ASRTrainer(BaseTrainer):
                     # Generate sequences using greedy search
                     seqs, scores = generator.generate_greedy(
                         prompts,
-                        temperature=recognition_config['temperature'],
-                        repeat_penalty=recognition_config['repeat_penalty']
+                        temperature=temperature,
+                        repeat_penalty=repeat_penalty
                     )
 
-                # Clean up
+                # Clean up — no empty_cache() as it causes GPU-CPU sync overhead
                 del feats, feat_lengths, encoder_output, pad_mask_src, prompts
                 
                 # Post process sequences
@@ -466,7 +477,7 @@ class ASRTrainer(BaseTrainer):
 
                 batch_bar.update()
 
-                if recognition_config['num_batches'] is not None and i >= recognition_config['num_batches'] - 1:
+                if num_batches is not None and i >= num_batches - 1:
                     break
 
             batch_bar.close()
@@ -870,6 +881,3 @@ class ProgressiveTrainer(ASRTrainer):
         )
         
         return subset_loader
-        
-        
-        
