@@ -140,13 +140,15 @@ class DecoderOnlyTransformer(nn.Module):
         if target_lengths is not None:
             pad_mask_dec = PadMask(target_lengths, padded_targets.size(1)).to(padded_targets.device)
         
-        # Cache causal mask by length — avoids reallocating the same tensor every forward pass
+        # Cache causal mask by (length, device) — avoids reallocating the same tensor every forward pass
         tgt_len = padded_targets.size(1)
+        tgt_device = padded_targets.device
         if not hasattr(self, '_causal_mask_cache'):
             self._causal_mask_cache = {}
-        if tgt_len not in self._causal_mask_cache:
-            self._causal_mask_cache[tgt_len] = CausalMask(tgt_len).to(padded_targets.device)
-        causal_mask = self._causal_mask_cache[tgt_len]
+        cache_key = (tgt_len, tgt_device)
+        if cache_key not in self._causal_mask_cache:
+            self._causal_mask_cache[cache_key] = CausalMask(tgt_len).to(tgt_device)
+        causal_mask = self._causal_mask_cache[cache_key]
 
         x = self.target_embedding(padded_targets)
         x = self.positional_encoding(x)
@@ -324,13 +326,15 @@ class EncoderDecoderTransformer(nn.Module):
         if pad_mask_tgt is None and self.training:
             warnings.warn("pad_mask_tgt is None, unless you are using the decoder as a standalone model or doing inference, you should provide target_lengths")
 
-        # Cache causal mask by length — avoids reallocating the same tensor every forward pass
+        # Cache causal mask by (length, device) — avoids reallocating the same tensor every forward pass
         tgt_len = padded_targets.size(1)
+        tgt_device = padded_targets.device
         if not hasattr(self, '_causal_mask_cache'):
             self._causal_mask_cache = {}
-        if tgt_len not in self._causal_mask_cache:
-            self._causal_mask_cache[tgt_len] = CausalMask(tgt_len).to(padded_targets.device)
-        causal_mask = self._causal_mask_cache[tgt_len]
+        cache_key = (tgt_len, tgt_device)
+        if cache_key not in self._causal_mask_cache:
+            self._causal_mask_cache[cache_key] = CausalMask(tgt_len).to(tgt_device)
+        causal_mask = self._causal_mask_cache[cache_key]
 
         x_dec = self.target_embedding(padded_targets)
         if not self.skip_decoder_pe:
