@@ -23,26 +23,13 @@ def PadMask(padded_input, input_lengths):
     Returns:
         Boolean mask tensor with shape (N, T).
     """
-    # Detect if we were passed (targets, lengths) or (lengths, max_len)
-    if torch.is_tensor(padded_input) and padded_input.dim() > 1:
-        # Standard case: (N, T, ...) and (N,)
-        N = padded_input.size(0)
-        T = padded_input.size(1)
-        lengths = input_lengths
-    else:
-        # transformers.py call case: (lengths, max_len)
-        lengths = padded_input
-        N = lengths.size(0)
-        T = input_lengths
-        
-    # Create mask: [N, T]
-    # Indices [0, 1, ..., T-1]
-    indices = torch.arange(T, device=lengths.device).expand(N, T)
-    
-    # Mask is True where index >= length
-    mask = indices >= lengths.unsqueeze(1)
-    
-    return mask
+    # Build time indices [0, 1, ..., T-1] and compare each index with valid length.
+    seq_len = padded_input.size(1)
+    time_idx = torch.arange(seq_len, device=padded_input.device).unsqueeze(0)  # (1, T)
+    valid_lens = input_lengths.to(padded_input.device).unsqueeze(1)             # (N, 1)
+
+    # True where index is beyond valid length => padded position.
+    return time_idx >= valid_lens
 
 ''' 
 TODO: Implement this function.
@@ -60,21 +47,14 @@ def CausalMask(padded_input):
     """ 
     Create a causal mask for self-attention. 
     Args:
-        padded_input: Input tensor, shape (N, T, ...) or integer T.
+        padded_input: Input tensor, shape (N, T, ...).
     Returns:
         Boolean mask tensor with shape (T, T).
     """
-    # Handle both tensor input (N, T, ...) and integer input (T)
-    if torch.is_tensor(padded_input):
-        T = padded_input.size(1)
-        device = padded_input.device
-    else:
-        T = padded_input
-        device = 'cpu' # Will be moved to device by .to() in transformers.py
-        
-    # Create upper triangular mask (True for values we want to mask)
-    # diagonal=1 means we keep the diagonal as False (not masked)
-    mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
-    
-    return mask
+    # Upper-triangular mask (excluding diagonal) blocks attention to future positions.
+    seq_len = padded_input.size(1)
+    return torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=padded_input.device),
+        diagonal=1,
+    )
 
